@@ -1,6 +1,4 @@
-#!/usr/bin/env bash
 set -e
-
 echo "==================================================================="
 echo " Data Analytics Worker Agent - Complete Prerequisites Setup"
 echo "==================================================================="
@@ -11,7 +9,7 @@ echo "==================================================================="
 export PROJECT_ID=$(gcloud config get-value project 2>/dev/null)
 export USER_EMAIL=$(gcloud config get-value account 2>/dev/null)
 export REGION="us-central1"
-export CATALOG_MCP_URL="https://knowledge-catalog-mcp-34m7rs7eva-uc.a.run.app/sse"
+export SERVICE_NAME="knowledge-catalog-mcp"
 
 if [ -z "$PROJECT_ID" ]; then
     echo "❌ ERROR: No active Google Cloud project set in gcloud."
@@ -26,6 +24,20 @@ if [ -z "$USER_EMAIL" ]; then
 fi
 
 export PROJECT_NUM=$(gcloud projects describe "$PROJECT_ID" --format='value(projectNumber)')
+
+# Fetch Cloud Run service URL dynamically after PROJECT_ID is verified
+RUN_SERVICE_URL=$(gcloud run services describe "${SERVICE_NAME}" \
+    --project="${PROJECT_ID}" \
+    --region="${REGION}" \
+    --format='value(status.url)' 2>/dev/null || true)
+
+if [ -z "$RUN_SERVICE_URL" ]; then
+    echo "❌ ERROR: Cloud Run service '${SERVICE_NAME}' not found in region '${REGION}'."
+    echo "Make sure the MCP server is deployed first."
+    exit 1
+fi
+
+export CATALOG_MCP_URL="${RUN_SERVICE_URL}/sse"
 
 echo "Active Project:  ${PROJECT_ID} (Number: ${PROJECT_NUM})"
 echo "Active Account:  ${USER_EMAIL}"
