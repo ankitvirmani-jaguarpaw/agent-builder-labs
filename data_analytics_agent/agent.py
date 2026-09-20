@@ -26,39 +26,60 @@ logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
 # =====================================================================
-# Configuration
+# Configuration (Container-Safe: Loaded from Env / ADC)
 # =====================================================================
-PROJECT_ID = os.getenv("GOOGLE_CLOUD_PROJECT")
-if not PROJECT_ID:
-    raise ValueError("GOOGLE_CLOUD_PROJECT environment variable is required.")
+credentials, auth_project = google.auth.default()
 
-CATALOG_MCP_URL = os.getenv(
-    "CATALOG_MCP_URL",
-    "https://knowledge-catalog-mcp-34m7rs7eva-uc.a.run.app/sse",
+# 1. Resolve Project ID
+PROJECT_ID = (
+    os.getenv("GOOGLE_CLOUD_PROJECT")
+    or auth_project
+    or os.getenv("DEVSHELL_PROJECT_ID")
 )
+if not PROJECT_ID:
+    raise ValueError(
+        "GOOGLE_CLOUD_PROJECT environment variable is required and could not be detected."
+    )
+
+# 2. Location & Model Backend
+LOCATION = os.getenv("GOOGLE_CLOUD_LOCATION", "us-central1")
+os.environ["GOOGLE_GENAI_USE_VERTEXAI"] = "true"
+os.environ["GOOGLE_CLOUD_PROJECT"] = PROJECT_ID
+os.environ["GOOGLE_CLOUD_LOCATION"] = LOCATION
+
+# 3. Resolve URLs
+CATALOG_MCP_URL = os.getenv("CATALOG_MCP_URL")
+if not CATALOG_MCP_URL:
+    raise ValueError(
+        "CATALOG_MCP_URL environment variable is required. Ensure it is defined in .env before deployment."
+    )
+
+JUDGE_AGENT_URL = os.getenv("JUDGE_AGENT_URL")
+if not JUDGE_AGENT_URL:
+    raise ValueError(
+        "JUDGE_AGENT_URL environment variable is required. Ensure it is defined in .env before deployment."
+    )
+
 agent_engine_id = os.getenv("GOOGLE_CLOUD_AGENT_ENGINE_ID")
 
-credentials, _ = google.auth.default()
-
-# Enforce Vertex AI backend for all Google LLM calls
-os.environ["GOOGLE_GENAI_USE_VERTEXAI"] = "true"
-os.environ.setdefault("GOOGLE_CLOUD_LOCATION", "us-central1")
-JUDGE_AGENT_URL = os.getenv("JUDGE_AGENT_URL",
-"https://judge-agent-34m7rs7eva-uc.a.run.app")
-if not JUDGE_AGENT_URL:
-    raise ValueError("JUDGE_AGENT_URL environment variable is required.")
-
+logger.info(f"Target Project ID: {PROJECT_ID}")
+logger.info(f"Knowledge Catalog SSE URL: {CATALOG_MCP_URL}")
+logger.info(f"Judge Agent URL: {JUDGE_AGENT_URL}")
 
 
 # =====================================================================
 # Tool 1: Knowledge Catalog MCP Connector (Tokenomics Layer)
 # =====================================================================
 async def query_knowledge_catalog(search_query: str) -> str:
-    """Consults the Knowledge Catalog MCP server to discover business formulas,
-    metric definitions, and BigQuery table partition rules.
+    """Primary tool for discovering available datasets, tables, schemas, metrics,
+    business formulas, and partition rules.
+
+    You MUST invoke this tool first to locate the project, dataset names, and
+    table references before performing any BigQuery operations.
 
     Args:
-        search_query: Concept, metric name, or table name (e.g. 'bounce rate', 'active users', 'ga_sessions').
+        search_query: Query string such as 'available datasets', table name, or
+          metric concept.
     """
     logger.info(f"--- 🛠️ Calling Knowledge Catalog MCP: '{search_query}' ---")
     try:
@@ -66,7 +87,7 @@ async def query_knowledge_catalog(search_query: str) -> str:
             # 1. Search semantic catalog
             search_res = await mcp_client.call_tool(
                 "search_knowledge_catalog",
-                arguments={"query": search_query}
+                arguments={"query": search_query},
             )
             raw_text = search_res.content[0].text if search_res.content else ""
 
@@ -76,7 +97,7 @@ async def query_knowledge_catalog(search_query: str) -> str:
             # 2. Fallback to direct metric lookup
             metric_res = await mcp_client.call_tool(
                 "get_semantic_metric",
-                arguments={"metric_name": search_query}
+                arguments={"metric_name": search_query},
             )
             return metric_res.content[0].text if metric_res.content else raw_text
 
@@ -110,26 +131,20 @@ async def _save_memory(callback_context: CallbackContext) -> None:
 # =====================================================================
 TOKENOMICS_GOVERNANCE_INSTRUCTION = f"""You are an elite Data Analytics Worker Agent with strict Tokenomics & Governance.
 
-CRITICAL OPERATIONAL RULES:
+CRITICAL OPERATIONAL SEQUENCE:
 
-1. MANDATORY KNOWLEDGE CATALOG DISCOVERY (Phase 1):
-   - You MUST call `query_knowledge_catalog` FIRST on every user request.
-   - If the user asks for a formula, metric definition, or table schema:
-     --> Answer immediately from the catalog.
-     --> YOU ARE STRICTLY FORBIDDEN FROM RUNNING BIGQUERY JOBS for conceptual/definition questions.
+1. MANDATORY CATALOG DISCOVERY (Step 1 - STRICT):
+   - You are STRICTLY FORBIDDEN from invoking any BigQuery tools (including listing datasets/tables or running SQL) without FIRST calling `query_knowledge_catalog`.
+   - If the user asks general questions like "What datasets are available?" or asks about schemas/metrics:
+     --> Call `query_knowledge_catalog(search_query="available datasets")`.
+     --> Do NOT call BigQuery `list_datasets`.
 
-2. BIGQUERY EXECUTION (Phase 2):
-   - Only run SQL queries when actual rows, counts, or live aggregations are requested.
+2. BIGQUERY EXECUTION (Step 2):
+   - Only query BigQuery when live rows or values are requested that cannot be answered by the catalog.
    - Use `{PROJECT_ID}` as the billing project.
-   - Always enforce partition filters (_TABLE_SUFFIX) learned from the catalog.
 
-3. MANDATORY A2A JUDGE REVIEW (Phase 3 - CRITICAL):
-   - Whenever you execute a BigQuery query or produce analytical data, **YOU MUST NOT RETURN THE FINAL ANSWER DIRECTLY TO THE USER**.
-   - You MUST call `transfer_to_agent` with agent_name='judge_agent' to submit your generated SQL and findings for quality review.
-   - Only after `judge_agent` approves the submission should the final response be presented to the user.
-
-4. USER PREFERENCES:
-   - Remember user preferences (preferred date ranges, standard filters, default groupings) across conversation sessions.
+3. MANDATORY A2A JUDGE REVIEW (Step 3):
+   - Transfer to `judge_agent` before returning analytical answers to the user.
 """
 
 # =====================================================================
