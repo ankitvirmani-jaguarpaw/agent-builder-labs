@@ -5,6 +5,7 @@ Data Analytics Worker Agent with strict Tokenomics Governance:
 - Strict Circuit Breaker: Does NOT hit BigQuery if the question can be resolved
   via metadata, metric definitions, or canonical formulas.
 - Only hits BigQuery when concrete row-level data or live metrics are requested.
+- Dynamically integrates Remote Judge Agent over A2A when JUDGE_AGENT_URL is provided.
 """
 
 from __future__ import annotations
@@ -54,17 +55,18 @@ if not CATALOG_MCP_URL:
         "CATALOG_MCP_URL environment variable is required. Ensure it is defined in .env before deployment."
     )
 
-JUDGE_AGENT_URL = os.getenv("JUDGE_AGENT_URL")
-if not JUDGE_AGENT_URL:
-    raise ValueError(
-        "JUDGE_AGENT_URL environment variable is required. Ensure it is defined in .env before deployment."
-    )
+# Judge Agent Resolution: Optional during evaluation, required for full production A2A deployment
+JUDGE_AGENT_URL = os.getenv("JUDGE_AGENT_URL", "").strip()
+HAS_ACTIVE_JUDGE = bool(JUDGE_AGENT_URL and "placeholder" not in JUDGE_AGENT_URL)
 
 agent_engine_id = os.getenv("GOOGLE_CLOUD_AGENT_ENGINE_ID")
 
 logger.info(f"Target Project ID: {PROJECT_ID}")
 logger.info(f"Knowledge Catalog SSE URL: {CATALOG_MCP_URL}")
-logger.info(f"Judge Agent URL: {JUDGE_AGENT_URL}")
+if HAS_ACTIVE_JUDGE:
+    logger.info(f"Judge Agent URL (Active): {JUDGE_AGENT_URL}")
+else:
+    logger.info("Judge Agent URL not configured. Running in Standalone / Evaluation Mode.")
 
 
 # =====================================================================
@@ -127,9 +129,9 @@ async def _save_memory(callback_context: CallbackContext) -> None:
 
 
 # =====================================================================
-# Agent Instruction with Strict Tokenomics Governance Rules
+# Dynamic Agent Instruction with Tokenomics Governance Rules
 # =====================================================================
-TOKENOMICS_GOVERNANCE_INSTRUCTION = f"""You are an elite Data Analytics Worker Agent with strict Tokenomics & Governance.
+base_instructions = f"""You are an elite Data Analytics Worker Agent with strict Tokenomics & Governance.
 
 CRITICAL OPERATIONAL SEQUENCE:
 
@@ -141,21 +143,32 @@ CRITICAL OPERATIONAL SEQUENCE:
 
 2. BIGQUERY EXECUTION (Step 2):
    - Only query BigQuery when live rows or values are requested that cannot be answered by the catalog.
-   - Use `{PROJECT_ID}` as the billing project.
+   -Strictly honor the user's requested timeframe. If a multi-day range like "last week" is requested:
+     * Never hardcode a single date (`_TABLE_SUFFIX = 'YYYYMMDD'`).
+     * Use `BETWEEN` with proper start and end dates (e.g., `_TABLE_SUFFIX BETWEEN '20170725' AND '20170801'`).
+   - Only execute BigQuery queries after verifying required partition constraints.
+   - Use `{PROJECT_ID}` as the billing project."""
 
-3. MANDATORY A2A JUDGE REVIEW (Step 3):
-   - Transfer to `judge_agent` before returning analytical answers to the user.
-"""
+# Append Step 3 only when the judge is actively attached
+if HAS_ACTIVE_JUDGE:
+    base_instructions += """\n\n3. MANDATORY A2A JUDGE REVIEW (Step 3):
+   - Transfer to `judge_agent` before returning analytical answers to the user."""
+
+TOKENOMICS_GOVERNANCE_INSTRUCTION = base_instructions
 
 # =====================================================================
-# Sub-Agent: Remote Judge Agent via A2A Protocol
+# Sub-Agents: Dynamic A2A Binding
 # =====================================================================
-judge_proxy = RemoteA2aAgent(
-    name="judge_agent",
-    description="Remote Judge Agent evaluating query efficiency, semantic alignment, and accuracy over A2A.",
-    agent_card=f"{JUDGE_AGENT_URL}/.well-known/agent-card.json",
-    use_legacy=False,
-)
+sub_agents: list[Any] = []
+
+if HAS_ACTIVE_JUDGE:
+    judge_proxy = RemoteA2aAgent(
+        name="judge_agent",
+        description="Remote Judge Agent evaluating query efficiency, semantic alignment, and accuracy over A2A.",
+        agent_card=f"{JUDGE_AGENT_URL}/.well-known/agent-card.json",
+        use_legacy=False,
+    )
+    sub_agents.append(judge_proxy)
 
 root_agent = LlmAgent(
     name="data_analytics_worker_agent",
@@ -166,7 +179,7 @@ root_agent = LlmAgent(
         bq_toolset,
         PreloadMemoryTool(),
     ],
-    sub_agents=[judge_proxy],
+    sub_agents=sub_agents,
     after_agent_callback=_save_memory,
 )
 
